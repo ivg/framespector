@@ -194,8 +194,8 @@ type Format.stag +=
   | File of {prev : string; curr : string; next : string}
   | Frame of Frame.t
   | Slot of Frame.slot * int
-  | Addr
-  | Data
+  | Addr of Addr.t
+  | Data of string
   | Changed
   | Backref of int
   | Arg
@@ -285,13 +285,12 @@ let state = Primus.Machine.State.declare
 
 module Inspectors = struct
   let selected = ref []
-  let run ppf frame slot i k =
+  let run ppf frame slot i =
     let opened =
       List.fold !selected ~init:0 ~f:(fun opened inspect ->
           match inspect frame slot i with
           | Some tag -> Format.pp_open_stag ppf tag; opened+1
           | None -> opened) in
-    k ();
     Fn.apply_n_times ~n:opened (Format.pp_close_stag ppf) ();
 end
 
@@ -327,6 +326,8 @@ module Orgmode = struct
         pp_trace (Frame.Prog.trace prog) in
     let print_open_stag = function
       | Frame f -> print_frame f
+      | Addr a -> Format.fprintf ppf "%s: " (Addr.string_of_value a)
+      | Data s -> Format.fprintf ppf "%s@\n" s
       | _ -> () in
     Format.pp_set_formatter_stag_functions ppf {
       mark_open_stag = (fun _ -> "");
@@ -357,13 +358,10 @@ let markup_frame ppf frame _before =
   List.iteri (Frame.slots frame) ~f:(fun i slot ->
       with_tag (Slot (slot,i)) @@ fun () ->
       let base = Frame.Slot.addr slot in
-      with_tag Addr begin fun () ->
-        fprintf ppf "%s: " (Addr.string_of_value base);
-      end;
-      with_tag Data begin fun () ->
-        Inspectors.run ppf frame slot i @@ fun () ->
-        let bytes = Frame.Slot.read slot `r8 in
-        Format.fprintf ppf "%s@\n" (hexdump bytes)
+      let data = hexdump@@Frame.Slot.read slot `r8 in
+      with_tag (Addr base) ignore;
+      with_tag (Data data) begin fun () ->
+        Inspectors.run ppf frame slot i;
       end)
 
 let queue_frame frame =
