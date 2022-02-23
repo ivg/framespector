@@ -191,6 +191,7 @@ end = struct
 end
 
 type Format.stag +=
+  | Stream
   | File of {prev : string; curr : string; next : string}
   | Frame of Frame.t
   | Slot of Frame.slot * int
@@ -198,7 +199,7 @@ type Format.stag +=
   | Data of string
   | Changed
   | Backref of int
-  | Arg
+  | Arg of string * int
   | Blk
 
 let when_frame_pointer fps v k =
@@ -340,6 +341,60 @@ module Orgmode = struct
 end
 
 
+module XML = struct
+  open Format
+
+  let straddr x = Addr.string_of_value x
+
+  let open_tag = function
+    | Stream -> "<frames>"
+    | File {prev; curr; next} ->
+      asprintf "<file prev=%S curr=%S next=%S>" prev curr next
+    | Frame frame ->
+      asprintf {|<frame base=%S size="%d">|}
+        (straddr (Frame.base frame))
+        (Frame.size frame)
+    | Slot (slot, pos) ->
+      let addr = Addr.string_of_value (Frame.Slot.addr slot) in
+      asprintf {|<slot addr=%S number="%d">|} addr pos
+    | Addr _ -> ""
+    | Data _ -> ""
+    | Changed -> "<changed>"
+    | Backref ref -> asprintf {|<backref slot="%d">|} ref
+    | Arg (sub,pos) -> asprintf {|<arg sub=%S pos="%d">|} sub pos
+    | Blk -> "<blk>"
+    | _ -> ""
+
+  let close_tag = function
+    | Stream -> "</frames>"
+    | File _ -> "</file>"
+    | Frame _ -> "</frame>"
+    | Slot _ -> "</slot>"
+    | Addr _ | Data _ -> ""
+    | Changed -> "</changed>"
+    | Backref _ -> "</backref>"
+    | Blk -> "</blk>"
+    | Arg _ -> "</arg>"
+    | _ -> ""
+
+  let print_data ppf = function
+    | Addr addr -> fprintf ppf "%s: " (straddr addr)
+    | Data data -> fprintf ppf "%s@\n" data
+    | _ -> ()
+
+  let enable ppf =
+    pp_set_print_tags ppf true;
+    pp_set_mark_tags ppf true;
+    pp_set_formatter_stag_functions ppf {
+      mark_open_stag = open_tag;
+      mark_close_stag = close_tag;
+      print_open_stag = print_data ppf;
+      print_close_stag = ignore;
+    }
+
+  let () = Formats.register "xml" enable
+end
+
 
 let pp_byte ppf byte =
   Format.fprintf ppf "%02x" (Word.to_int_exn byte)
@@ -389,9 +444,12 @@ let with_formatter prefix printed k = match prefix with
         k ppf;
         Format.pp_close_stag ppf ();
         Format.pp_print_flush ppf ())
-  | None ->
-    k Format.std_formatter;
-    Format.print_flush ()
+  | None -> k Format.std_formatter
+
+let close_stream prefix _ =
+  if Option.is_none prefix
+  then Format.(pp_close_stag std_formatter) ();
+  Analysis.return ()
 
 let print_pending format prefix _ =
   let* frames = Analysis.Local.get state in
@@ -403,6 +461,8 @@ let print_pending format prefix _ =
   } >>| fun () ->
   with_formatter prefix frames.printed @@ fun ppf ->
   Formats.enable format ppf;
+  if frames.printed = 0 && Option.is_none prefix
+  then Format.(pp_open_stag std_formatter) Stream;
   markup_frame ppf pending previous
 
 let init format prefix =
@@ -412,6 +472,7 @@ let init format prefix =
       stored >>> memory_update pointers;
       Frame.changed >>> queue_frame;
       pc_change >>> print_pending format prefix;
+      Primus.System.stop >>> close_stream prefix;
     ]
 
 let run start format prefix project =
