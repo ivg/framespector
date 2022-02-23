@@ -32,7 +32,8 @@ module Frame : sig
 
   module Slot : sig
     val addr : slot -> addr
-    val read : slot -> Size.t -> word list
+    val range : ?start:int -> ?stop:int -> ?size:Size.t -> slot -> word list
+    val read : ?size:Size.t -> slot -> int -> word option
   end
 
   module Prog : sig
@@ -58,15 +59,26 @@ end = struct
 
     let addr s = s.base
     let data s = s.data
-    let read {data; info} size =
+
+    let range ?(start=0) ?stop ?(size=`r8) {data; info} =
       let length = Size.in_bytes size in
       let concat = List.reduce_exn ~f:Word.concat in
       let is_big = is_big info in
-      List.chunks_of ~length data |>
+      let drop = Fn.flip List.drop start in
+      let take = match stop with
+        | None -> ident
+        | Some stop -> Fn.flip List.take (stop - start + 1) in
+      List.chunks_of ~length data |> drop |> take |>
       List.map ~f:(fun chunk ->
           if is_big
           then concat chunk
           else Fn.compose concat List.rev chunk)
+
+    let read ?size slot pos =
+      match range ?size ~start:pos ~stop:pos slot with
+      | [] -> None
+      | [x] -> Some x
+      | _ -> assert false
   end
 
   module Prog = struct
@@ -195,8 +207,9 @@ type Format.stag +=
   | File of {prev : string; curr : string; next : string}
   | Frame of Frame.t
   | Slot of Frame.slot * int
-  | Addr of Addr.t
-  | Data of string
+  | Addr
+  | Data
+  | Byte
   | Changed
   | Backref of int
   | Arg of string * int
@@ -283,16 +296,84 @@ let state = Primus.Machine.State.declare
     printed=0
   }
 
+module Inspector : sig
+  type t
+  val run : t -> Frame.t -> Frame.slot -> word -> Format.stag option
+end = struct
+  type t = Frame.t -> Frame.slot -> word -> Format.stag option
+  let run = ident
+end
 
-module Inspectors = struct
-  let selected = ref []
-  let run ppf frame slot i =
-    let opened =
-      List.fold !selected ~init:0 ~f:(fun opened inspect ->
-          match inspect frame slot i with
-          | Some tag -> Format.pp_open_stag ppf tag; opened+1
-          | None -> opened) in
-    Fn.apply_n_times ~n:opened (Format.pp_close_stag ppf) ();
+module Inspectors : sig
+  type actions
+  val apply : Frame.t -> Frame.slot -> actions
+  val enter : actions -> Format.formatter -> int -> unit
+  val leave : actions -> Format.formatter -> int -> unit
+end = struct
+  let selected : Inspector.t list ref  = ref []
+
+  (* maps byte offset into the open/close tags,
+     since we don't need to know the tag to close it,
+     we just remember the number of times we have to
+     pop the tag stack.
+  *)
+
+  type actions = {
+    enter : Format.stag list Map.M(Int).t;
+    leave : int Map.M(Int).t;
+  }
+
+  let init = {
+    enter = Map.empty (module Int);
+    leave = Map.empty (module Int)
+  }
+
+  let add_enter enter i size action =
+    Map.add_multi enter
+      ~key:(i * Size.in_bytes size)
+      ~data:action
+
+  let increment = function
+    | None -> 1
+    | Some n -> n+1
+
+  let add_leave leave i size =
+    Map.update leave ~f:increment
+      (i + Size.in_bytes size - 1)
+
+  let add_action actions i size action = {
+    enter = add_enter actions.enter i size action;
+    leave = add_leave actions.leave i size;
+  }
+
+  let sizes i =
+    List.filter_map [1; 2; 4; 8] ~f:(fun m ->
+        if i mod m = 0 then Some (Size.of_int_exn (m*8))
+        else None)
+
+  let apply frame slot =
+    List.(fold (range 0 8)) ~init ~f:(fun actions i ->
+        List.fold (sizes i) ~init:actions ~f:(fun actions size ->
+            List.fold !selected ~init:actions ~f:(fun actions inspector ->
+                let bytes = Size.in_bytes size in
+                match Frame.Slot.read ~size slot (i/bytes) with
+                | None -> actions
+                | Some word ->
+                  match Inspector.run inspector frame slot word with
+                  | None -> actions
+                  | Some action ->
+                    add_action actions i size action)))
+
+  let enter actions ppf i = match Map.find actions.enter i with
+    | None -> ()
+    | Some tags ->
+      List.iter tags ~f:(Format.pp_open_stag ppf)
+
+  let leave actions ppf i = match Map.find actions.leave i with
+    | None -> ()
+    | Some n ->
+      Fn.apply_n_times ~n (Format.pp_close_stag ppf) ()
+
 end
 
 module Formats : sig
@@ -327,14 +408,17 @@ module Orgmode = struct
         pp_trace (Frame.Prog.trace prog) in
     let print_open_stag = function
       | Frame f -> print_frame f
-      | Addr a -> Format.fprintf ppf "%s: " (Addr.string_of_value a)
-      | Data s -> Format.fprintf ppf "%s@\n" s
+      | Byte -> Format.fprintf ppf " "
+      | _ -> () in
+    let print_close_stag = function
+      | Addr -> Format.fprintf ppf ":"
+      | Data -> Format.fprintf ppf "@\n"
       | _ -> () in
     Format.pp_set_formatter_stag_functions ppf {
       mark_open_stag = (fun _ -> "");
       mark_close_stag = (fun _ -> "");
       print_open_stag;
-      print_close_stag=ignore;
+      print_close_stag;
     }
 
   let () = Formats.register name enable
@@ -355,10 +439,9 @@ module XML = struct
         (straddr (Frame.base frame))
         (Frame.size frame)
     | Slot (slot, pos) ->
-      let addr = Addr.string_of_value (Frame.Slot.addr slot) in
-      asprintf {|<slot addr=%S number="%d">|} addr pos
-    | Addr _ -> ""
-    | Data _ -> ""
+      asprintf {|<slot number="%d">|} pos
+    | Addr -> "<addr>"
+    | Data -> "<data>"
     | Changed -> "<changed>"
     | Backref ref -> asprintf {|<backref slot="%d">|} ref
     | Arg (sub,pos) -> asprintf {|<arg sub=%S pos="%d">|} sub pos
@@ -370,17 +453,31 @@ module XML = struct
     | File _ -> "</file>"
     | Frame _ -> "</frame>"
     | Slot _ -> "</slot>"
-    | Addr _ | Data _ -> ""
+    | Addr -> "</addr>"
+    | Data -> "</data>"
     | Changed -> "</changed>"
     | Backref _ -> "</backref>"
     | Blk -> "</blk>"
     | Arg _ -> "</arg>"
     | _ -> ""
 
-  let print_data ppf = function
-    | Addr addr -> fprintf ppf "%s: " (straddr addr)
-    | Data data -> fprintf ppf "%s@\n" data
-    | _ -> ()
+  let is_ignored tag = String.is_empty (close_tag tag)
+
+  let enter_tag ppf = function
+    | File _ | Stream -> ()
+    | Byte -> pp_print_string ppf " "
+    | tag when is_ignored tag -> ()
+    | _ ->
+      pp_open_vbox ppf 2;
+      pp_print_cut ppf ()
+
+
+  let leave_tag ppf = function
+    | File _ | Stream | Byte -> ()
+    | tag when is_ignored tag -> ()
+    | _ ->
+      pp_close_box ppf ();
+      pp_print_cut ppf ()
 
   let enable ppf =
     pp_set_print_tags ppf true;
@@ -388,8 +485,8 @@ module XML = struct
     pp_set_formatter_stag_functions ppf {
       mark_open_stag = open_tag;
       mark_close_stag = close_tag;
-      print_open_stag = print_data ppf;
-      print_close_stag = ignore;
+      print_open_stag = enter_tag ppf;
+      print_close_stag = leave_tag ppf;
     }
 
   let () = Formats.register "xml" enable
@@ -413,10 +510,18 @@ let markup_frame ppf frame _before =
   List.iteri (Frame.slots frame) ~f:(fun i slot ->
       with_tag (Slot (slot,i)) @@ fun () ->
       let base = Frame.Slot.addr slot in
-      let data = hexdump@@Frame.Slot.read slot `r8 in
-      with_tag (Addr base) ignore;
-      with_tag (Data data) begin fun () ->
-        Inspectors.run ppf frame slot i;
+      let bytes = Frame.Slot.range slot in
+      let actions = Inspectors.apply frame slot in
+      with_tag Addr begin fun () ->
+        fprintf ppf "%s" (Addr.string_of_value base);
+      end;
+      with_tag Data begin fun () ->
+        List.iteri bytes ~f:(fun i byte ->
+            Inspectors.enter actions ppf i;
+            with_tag Byte begin fun () ->
+              fprintf ppf "%a" pp_byte byte;
+            end;
+            Inspectors.leave actions ppf i)
       end)
 
 let queue_frame frame =
