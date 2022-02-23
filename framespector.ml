@@ -214,6 +214,7 @@ type Format.stag +=
   | Data
   | Byte
   | Changed
+  | Slotref
   | Backref of int
   | Arg of string * int
   | Blk
@@ -479,6 +480,7 @@ module XML = struct
     | Addr -> "<addr>"
     | Data -> "<data>"
     | Changed -> "<changed>"
+    | Slotref -> "<slotref>"
     | Backref ref -> asprintf {|<backref slot="%d">|} ref
     | Arg (sub,pos) -> asprintf {|<arg sub=%S pos="%d">|} sub pos
     | Blk -> "<blk>"
@@ -492,6 +494,7 @@ module XML = struct
     | Addr -> "</addr>"
     | Data -> "</data>"
     | Changed -> "</changed>"
+    | Slotref -> "</slotref>"
     | Backref _ -> "</backref>"
     | Blk -> "</blk>"
     | Arg _ -> "</arg>"
@@ -563,13 +566,14 @@ module SVG = struct
     | Addr -> asprintf {|<tspan x="%d" fill="white">|}
                 (hor_margin / 2)
     | Data -> "<tspan>"
+    | Slotref -> {|<tspan fill="red">|}
     | Blk -> {|<tspan fill="blue">|}
     | _ -> ""
 
   let close_tag = function
     | Frame _ -> "</svg>"
     | Slot _ -> "</text>"
-    | Addr | Data | Blk -> "</tspan>"
+    | Addr | Data | Blk | Slotref -> "</tspan>"
     | _ -> ""
 
   let enter_tag = XML.enter_tag
@@ -709,7 +713,21 @@ module Blocks = struct
   let check blks frame slot word =
     Option.some_if (Set.mem blks word) Blk
 
-  let () = Inspectors.add @@ Inspector.def () ~state ~check
+  let () = Inspectors.add @@ Inspector.def ~state ~check ()
+end
+
+module Backrefs = struct
+  let state = Primus.Machine.State.declare
+      ~uuid:"56446d70-b07a-43b1-b1e5-6f48e02a61bc"
+      ~name:"framespector-slot-references" ignore
+
+  let check () frame slot word =
+    let is_referenced =
+      List.exists (Frame.slots frame) ~f:(fun s ->
+          Addr.equal (Frame.Slot.addr s) word) in
+    Option.some_if is_referenced Slotref
+
+  let () = Inspectors.add @@ Inspector.def ~state ~check ()
 end
 
 let start = Extension.Configuration.parameter
