@@ -292,23 +292,33 @@ let state = Primus.Machine.State.declare
     printed=0
   }
 
+module Inspect = struct
+  type action =
+    | Word of Format.stag
+    | Slot of Format.stag
+    | Pass
+
+end
+
 module Inspector : sig
   type t
-  val run : t -> Frame.t -> Frame.slot -> word -> Format.stag option
+
+  val run : t -> Frame.t -> Frame.slot -> word -> Inspect.action
   val def :
     ?start:unit Analysis.t ->
     state:'a Primus.state ->
-    check:('a -> Frame.t -> Frame.slot -> word -> Format.stag option) ->
+    check:('a -> Frame.t -> Frame.slot -> word -> Inspect.action) ->
     unit ->
     t
   val enable : t -> unit Analysis.t
   val update : t -> t Analysis.t
 end = struct
+
   type t = Inspector : {
       start : unit Analysis.t;
       renew : 'a Analysis.t;
       state : 'a option;
-      check : 'a -> Frame.t -> Frame.slot -> word -> Format.stag option
+      check : 'a -> Frame.t -> Frame.slot -> word -> Inspect.action
     } -> t
 
   let def ?(start=Analysis.return ()) ~state ~check () =
@@ -330,8 +340,10 @@ module Inspectors : sig
   type actions
   val add : Inspector.t -> unit
   val apply : Frame.t -> Frame.slot -> actions
-  val enter : actions -> Format.formatter -> int -> unit
-  val leave : actions -> Format.formatter -> int -> unit
+  val enter_slot : actions -> Format.formatter -> unit
+  val enter_byte : actions -> Format.formatter -> int -> unit
+  val leave_byte : actions -> Format.formatter -> int -> unit
+  val leave_slot : actions -> Format.formatter -> unit
   val start : unit -> unit Analysis.t
   val update : unit -> unit Analysis.t
 end = struct
@@ -344,13 +356,17 @@ end = struct
   *)
 
   type actions = {
-    enter : Format.stag list Map.M(Int).t;
-    leave : int Map.M(Int).t;
+    enter_slot : Format.stag list;
+    enter_byte : Format.stag list Map.M(Int).t;
+    leave_byte : int Map.M(Int).t;
+    leave_slot : int;
   }
 
   let init = {
-    enter = Map.empty (module Int);
-    leave = Map.empty (module Int)
+    enter_slot = [];
+    enter_byte = Map.empty (module Int);
+    leave_byte = Map.empty (module Int);
+    leave_slot = 0;
   }
 
   let add inspector =
@@ -379,9 +395,16 @@ end = struct
     Map.update leave ~f:increment
       (i + Size.in_bytes size - 1)
 
-  let add_action actions i size action = {
-    enter = add_enter actions.enter i size action;
-    leave = add_leave actions.leave i size;
+  let add_word_action actions i size action = {
+    actions with
+    enter_byte = add_enter actions.enter_byte i size action;
+    leave_byte = add_leave actions.leave_byte i size;
+  }
+
+  let add_slot_action actions action = {
+    actions with
+    enter_slot = action :: actions.enter_slot;
+    leave_slot = actions.leave_slot + 1;
   }
 
   let sizes i =
@@ -398,19 +421,31 @@ end = struct
                 | None -> actions
                 | Some word ->
                   match Inspector.run inspector frame slot word with
-                  | None -> actions
-                  | Some action ->
-                    add_action actions i size action)))
+                  | Pass -> actions
+                  | Word action ->
+                    add_word_action actions i size action
+                  | Slot action ->
+                    add_slot_action actions action)))
 
-  let enter actions ppf i = match Map.find actions.enter i with
-    | None -> ()
-    | Some tags ->
-      List.iter tags ~f:(Format.pp_open_stag ppf)
+  let open_tags ppf tags =
+    List.iter tags ~f:(Format.pp_open_stag ppf)
 
-  let leave actions ppf i = match Map.find actions.leave i with
+  let close_tags ppf n =
+    Fn.apply_n_times ~n (Format.pp_close_stag ppf) ()
+
+  let enter_byte actions ppf i =
+    match Map.find actions.enter_byte i with
     | None -> ()
-    | Some n ->
-      Fn.apply_n_times ~n (Format.pp_close_stag ppf) ()
+    | Some tags -> open_tags ppf tags
+
+  let leave_byte actions ppf i =
+    match Map.find actions.leave_byte i with
+    | None -> ()
+    | Some n -> close_tags ppf n
+
+  let enter_slot {enter_slot} ppf = open_tags ppf enter_slot
+  let leave_slot {leave_slot} ppf = close_tags ppf leave_slot
+
 
 end
 
@@ -612,21 +647,24 @@ let markup_frame ppf frame _before =
     pp_close_stag ppf () in
   with_tag (Frame frame) @@ fun () ->
   List.iteri (Frame.slots frame) ~f:(fun i slot ->
-      with_tag (Slot (slot,i)) @@ fun () ->
-      let base = Frame.Slot.addr slot in
-      let bytes = Frame.Slot.range slot in
       let actions = Inspectors.apply frame slot in
-      with_tag Addr begin fun () ->
-        fprintf ppf "%s" (Addr.string_of_value base);
+      Inspectors.enter_slot actions ppf;
+      with_tag (Slot (slot,i)) begin fun () ->
+        let base = Frame.Slot.addr slot in
+        let bytes = Frame.Slot.range slot in
+        with_tag Addr begin fun () ->
+          fprintf ppf "%s" (Addr.string_of_value base);
+        end;
+        with_tag Data begin fun () ->
+          List.iteri bytes ~f:(fun i byte ->
+              Inspectors.enter_byte actions ppf i;
+              with_tag Byte begin fun () ->
+                fprintf ppf "%a" pp_byte byte;
+              end;
+              Inspectors.leave_byte actions ppf i)
+        end
       end;
-      with_tag Data begin fun () ->
-        List.iteri bytes ~f:(fun i byte ->
-            Inspectors.enter actions ppf i;
-            with_tag Byte begin fun () ->
-              fprintf ppf "%a" pp_byte byte;
-            end;
-            Inspectors.leave actions ppf i)
-      end)
+      Inspectors.leave_slot actions ppf)
 
 let queue_frame frame =
   Analysis.Local.update state ~f:(fun frames -> {
@@ -711,7 +749,7 @@ module Blocks = struct
       ~name:"framespector-basic-blocks" blocks
 
   let check blks frame slot word =
-    Option.some_if (Set.mem blks word) Blk
+    if Set.mem blks word then (Inspect.Word Blk) else Inspect.Pass
 
   let () = Inspectors.add @@ Inspector.def ~state ~check ()
 end
@@ -725,7 +763,7 @@ module Backrefs = struct
     let is_referenced =
       List.exists (Frame.slots frame) ~f:(fun s ->
           Addr.equal (Frame.Slot.addr s) word) in
-    Option.some_if is_referenced Slotref
+    if is_referenced then (Inspect.Word Slotref) else Pass
 
   let () = Inspectors.add @@ Inspector.def ~state ~check ()
 end
