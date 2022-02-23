@@ -30,6 +30,8 @@ module Frame : sig
   val prog : t -> prog
   val slots : t -> slot list
 
+  val target : t -> Theory.target
+
   module Slot : sig
     val addr : slot -> addr
     val range : ?start:int -> ?stop:int -> ?size:Size.t -> slot -> word list
@@ -102,6 +104,7 @@ end = struct
   }
 
 
+  let target f = f.info.target
   let base f = f.base
   let prog f = f.prog
   let slots f = f.data
@@ -424,7 +427,6 @@ module Orgmode = struct
   let () = Formats.register name enable
 end
 
-
 module XML = struct
   open Format
 
@@ -492,6 +494,71 @@ module XML = struct
   let () = Formats.register "xml" enable
 end
 
+module SVG = struct
+  open Format
+  let preamble = {|<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!DOCTYPE svg PUBLIC "-//W3C//DTD SVG 1.1//EN" "http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd">
+|}
+
+  let font_height = 20  (* px *)
+  let hor_margin = 40 (* px *)
+  let ver_margin = 10 (* px *)
+  let font_width = Float.(to_int (float font_height * 0.6))
+
+
+  let frame_height frame =
+    font_height * List.length (Frame.slots frame) + ver_margin * 2
+
+  let frame_width frame =
+    let t = Frame.target frame in
+    let x = Theory.Target.data_addr_size t / 8 in
+    let m = font_width in
+    x*m + 2*m + 2*x*m + (x-1)*m + hor_margin
+
+
+  let open_tag = function
+    | Stream | File _ -> preamble
+    | Frame f ->
+      asprintf {|
+<svg xmlns="http://www.w3.org/2000/svg"
+     height="%dpx"
+     width="%dpx"
+     font-family="monospace"
+     font-size="%dpx">
+    <rect fill="black" height="100%%" width="100%%"/>|}
+        (frame_height f) (frame_width f) font_height
+    | Slot (s,i) -> asprintf {|<text fill="grey" y="%dem">|} (i+1)
+    | Addr -> asprintf {|<tspan x="%d" fill="white">|}
+                (hor_margin / 2)
+    | Data -> "<tspan>"
+    | _ -> ""
+
+  let close_tag = function
+    | Frame _ -> "</svg>"
+    | Slot _ -> "</text>"
+    | Addr | Data -> "</tspan>"
+    | _ -> ""
+
+  let enter_tag = XML.enter_tag
+
+  let leave_tag ppf = function
+    | Addr ->
+      pp_print_string ppf ":";
+      XML.leave_tag ppf Addr;
+    | tag -> XML.leave_tag ppf tag
+
+  let enable ppf =
+    pp_set_print_tags ppf true;
+    pp_set_mark_tags ppf true;
+    pp_set_formatter_stag_functions ppf {
+      mark_open_stag = open_tag;
+      mark_close_stag = close_tag;
+      print_open_stag = enter_tag ppf;
+      print_close_stag = leave_tag ppf;
+    }
+
+  let () = Formats.register "svg" enable
+end
 
 let pp_byte ppf byte =
   Format.fprintf ppf "%02x" (Word.to_int_exn byte)
@@ -535,14 +602,14 @@ let peek_frames {pending; compare} k =
   | Some frame,None -> k frame None
   | Some last,Some before -> k last (Some before)
 
-let make_name prefix printed =
-  Format.asprintf "%s-%04d.frame" prefix printed
+let make_name prefix suffix printed =
+  Format.asprintf "%s-%04d.%s" prefix printed suffix
 
-let with_formatter prefix printed k = match prefix with
+let with_formatter ~prefix ~format printed k = match prefix with
   | Some prefix ->
-    let prev = make_name prefix (printed-1) in
-    let curr = make_name prefix printed in
-    let next = make_name prefix (printed+1) in
+    let prev = make_name prefix format (printed-1) in
+    let curr = make_name prefix format printed in
+    let next = make_name prefix format (printed+1) in
     Out_channel.with_file curr ~f:(fun out ->
         let ppf = Format.formatter_of_out_channel out in
         Format.pp_open_stag ppf (File {prev;curr;next});
@@ -564,7 +631,7 @@ let print_pending format prefix _ =
     pending = None;
     printed = frames.printed + 1
   } >>| fun () ->
-  with_formatter prefix frames.printed @@ fun ppf ->
+  with_formatter ~prefix ~format frames.printed @@ fun ppf ->
   Formats.enable format ppf;
   if frames.printed = 0 && Option.is_none prefix
   then Format.(pp_open_stag std_formatter) Stream;

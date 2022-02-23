@@ -1,3 +1,4 @@
 /_build/
 /e2-0000.frame
 *.frame
+*.svg
