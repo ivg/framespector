@@ -49,7 +49,7 @@ end = struct
   }
 
   let is_big {target} =
-    Theory.Endianness.(equal le) @@
+    Theory.Endianness.(equal eb) @@
     Theory.Target.endianness target
 
   module Slot = struct
@@ -263,14 +263,6 @@ let with_level3 attr pos k =
   | Jmp {me; up={up={me=sub}}} ->
     k sub (get me)
 
-let blocks proj =
-  Project.disasm proj |>
-  Disasm.cfg |>
-  Graphs.Cfg.nodes |>
-  Seq.map ~f:Block.addr |>
-  Seq.fold ~f:Set.add
-    ~init:Addr.Set.empty
-
 let pp_pos ppf = function
   | Primus.Pos.Top _ -> Format.fprintf ppf "<sporadic>:"
   | Sub {me} -> Format.fprintf ppf "<%s>: (stub)" (Sub.name me)
@@ -302,16 +294,45 @@ let state = Primus.Machine.State.declare
 module Inspector : sig
   type t
   val run : t -> Frame.t -> Frame.slot -> word -> Format.stag option
+  val def :
+    ?start:unit Analysis.t ->
+    state:'a Primus.state ->
+    check:('a -> Frame.t -> Frame.slot -> word -> Format.stag option) ->
+    unit ->
+    t
+  val enable : t -> unit Analysis.t
+  val update : t -> t Analysis.t
 end = struct
-  type t = Frame.t -> Frame.slot -> word -> Format.stag option
-  let run = ident
+  type t = Inspector : {
+      start : unit Analysis.t;
+      renew : 'a Analysis.t;
+      state : 'a option;
+      check : 'a -> Frame.t -> Frame.slot -> word -> Format.stag option
+    } -> t
+
+  let def ?(start=Analysis.return ()) ~state ~check () =
+    let renew = Analysis.Local.get state in
+    Inspector {start; renew; state=None; check}
+
+  let run (Inspector {state; check}) =
+    check (Option.value_exn state)
+
+  let update (Inspector self) =
+    let+ state = self.renew in
+    Inspector {self with state=Some state}
+
+  let enable (Inspector self) = self.start
+
 end
 
 module Inspectors : sig
   type actions
+  val add : Inspector.t -> unit
   val apply : Frame.t -> Frame.slot -> actions
   val enter : actions -> Format.formatter -> int -> unit
   val leave : actions -> Format.formatter -> int -> unit
+  val start : unit -> unit Analysis.t
+  val update : unit -> unit Analysis.t
 end = struct
   let selected : Inspector.t list ref  = ref []
 
@@ -330,6 +351,19 @@ end = struct
     enter = Map.empty (module Int);
     leave = Map.empty (module Int)
   }
+
+  let add inspector =
+    selected := inspector :: !selected
+
+  let start () =
+    List.map !selected ~f:Inspector.enable |>
+    Analysis.List.sequence
+
+  let update () =
+    let+ inspectors =
+      List.map !selected ~f:Inspector.update |>
+      Analysis.List.all in
+    selected := inspectors
 
   let add_enter enter i size action =
     Map.add_multi enter
@@ -394,7 +428,7 @@ end = struct
 end
 
 module Orgmode = struct
-  let name = "orgmode"
+  let name = "org"
 
   let pp_trace ppf = function
     | x :: _ -> pp_pos ppf x
@@ -505,7 +539,6 @@ module SVG = struct
   let ver_margin = 10 (* px *)
   let font_width = Float.(to_int (float font_height * 0.6))
 
-
   let frame_height frame =
     font_height * List.length (Frame.slots frame) + ver_margin * 2
 
@@ -514,7 +547,6 @@ module SVG = struct
     let x = Theory.Target.data_addr_size t / 8 in
     let m = font_width in
     x*m + 2*m + 2*x*m + (x-1)*m + hor_margin
-
 
   let open_tag = function
     | Stream | File _ -> preamble
@@ -531,12 +563,13 @@ module SVG = struct
     | Addr -> asprintf {|<tspan x="%d" fill="white">|}
                 (hor_margin / 2)
     | Data -> "<tspan>"
+    | Blk -> {|<tspan fill="blue">|}
     | _ -> ""
 
   let close_tag = function
     | Frame _ -> "</svg>"
     | Slot _ -> "</text>"
-    | Addr | Data -> "</tspan>"
+    | Addr | Data | Blk -> "</tspan>"
     | _ -> ""
 
   let enter_tag = XML.enter_tag
@@ -624,6 +657,7 @@ let close_stream prefix _ =
   Analysis.return ()
 
 let print_pending format prefix _ =
+  Inspectors.update () >>= fun () ->
   let* frames = Analysis.Local.get state in
   peek_frames frames @@ fun pending previous ->
   Analysis.Local.put state {
@@ -644,6 +678,7 @@ let init format prefix =
       stored >>> memory_update pointers;
       Frame.changed >>> queue_frame;
       pc_change >>> print_pending format prefix;
+      Primus.System.init >>> Inspectors.start;
       Primus.System.stop >>> close_stream prefix;
     ]
 
@@ -658,6 +693,25 @@ let run start format prefix project =
   | Ok (_, project, _) -> project
   | Error _ -> project
 
+module Blocks = struct
+  let blocks proj =
+    Project.disasm proj |>
+    Disasm.cfg |>
+    Graphs.Cfg.nodes |>
+    Seq.map ~f:Block.addr |>
+    Seq.fold ~f:Set.add
+      ~init:Addr.Set.empty
+
+  let state = Primus.Machine.State.declare
+      ~uuid:"b9f2901d-1f56-4bee-a979-fd01607c5751"
+      ~name:"framespector-basic-blocks" blocks
+
+  let check blks frame slot word =
+    Option.some_if (Set.mem blks word) Blk
+
+  let () = Inspectors.add @@ Inspector.def () ~state ~check
+end
+
 let start = Extension.Configuration.parameter
     Extension.Type.(string =? "_start") "start"
 
@@ -668,7 +722,7 @@ let prefix = Extension.Configuration.parameter
           $(b,xxxx) stands for the frame number"
 
 let format = Extension.Configuration.parameter
-    Extension.Type.(string =? "orgmode") "format"
+    Extension.Type.(string =? "org") "format"
     ~doc:"Print frames in the selected format"
 
 let () = Extension.declare @@ fun ctxt ->
