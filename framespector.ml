@@ -473,12 +473,13 @@ end = struct
     | Some enable -> enable ppf
 end
 
-module Orgmode = struct
-  let name = "org"
+let pp_trace ppf = function
+  | x :: _ -> pp_pos ppf x
+  | _ -> ()
 
-  let pp_trace ppf = function
-    | x :: _ -> pp_pos ppf x
-    | _ -> ()
+
+module Org = struct
+  let name = "org"
 
   let enable ppf =
     Format.pp_set_print_tags ppf true;
@@ -589,7 +590,7 @@ module SVG = struct
   let font_width = Float.(to_int (float font_height * 0.6))
 
   let frame_height frame =
-    font_height * List.length (Frame.slots frame) + ver_margin * 2
+    font_height * (List.length (Frame.slots frame) + 1) + ver_margin * 2
 
   let frame_width frame =
     let t = Frame.target frame in
@@ -601,22 +602,38 @@ module SVG = struct
 
   let right_of_slot frame slot = {
     x = frame_width frame - hor_margin / 2 + 5;
-    y = font_height * slot + ver_margin + font_height / 4;
+    y = font_height * (slot + 1) + ver_margin + font_height / 4;
   }
+
+
+  let escape =
+    String.concat_map ~f:(function
+        | '<' -> "&lt;"
+        | '>' -> "&gt;"
+        | c -> String.of_char c)
 
 
   let open_tag = function
     | Stream | File _ -> preamble
     | Frame f ->
+      let prog = Frame.prog f in
+      let pc = Frame.Prog.start prog in
+      let title = asprintf "%s %a"
+          (Addr.string_of_value pc)
+          pp_trace (Frame.Prog.trace prog) in
       asprintf {|
 <svg xmlns="http://www.w3.org/2000/svg"
      height="%dpx"
      width="%dpx"
      font-family="monospace"
      font-size="%dpx">
-    <rect fill="black" height="100%%" width="100%%"/>|}
+    <rect fill="black" height="100%%" width="100%%"/>
+    <text x="%d" fill="green" y="1em">%s</text>
+|}
         (frame_height f) (frame_width f) font_height
-    | Slot (s,i) -> asprintf {|<text fill="grey" y="%dem">|} (i+1)
+        (hor_margin / 2)
+        (escape title)
+    | Slot (s,i) -> asprintf {|<text fill="grey" y="%dem">|} (i+2)
     | Addr -> asprintf {|<tspan x="%d" fill="white">|}
                 (hor_margin / 2)
     | Data -> "<tspan>"
