@@ -29,11 +29,15 @@ module Frame : sig
   val base : t -> addr
   val prog : t -> prog
   val slots : t -> slot list
+  val slot : t -> addr -> slot option
 
   val target : t -> Theory.target
 
   module Slot : sig
     val addr : slot -> addr
+    val offset : slot -> int
+    val equal_addr : slot -> slot -> bool
+    val has_addr : addr -> slot -> bool
     val range : ?start:int -> ?stop:int -> ?size:Size.t -> slot -> word list
     val read : ?size:Size.t -> slot -> int -> word option
   end
@@ -57,10 +61,14 @@ end = struct
       info : info;
       base : addr;
       data : word list;
+      offs : int;
     }
 
     let addr s = s.base
     let data s = s.data
+    let offset s = s.offs
+    let equal_addr x y = Addr.equal x.base y.base
+    let has_addr addr x = Addr.equal x.base addr
 
     let range ?(start=0) ?stop ?(size=`r8) {data; info} =
       let length = Size.in_bytes size in
@@ -109,6 +117,7 @@ end = struct
   let prog f = f.prog
   let slots f = f.data
   let size f = f.size
+  let slot f addr = List.find f.data ~f:(Slot.has_addr addr)
 
   let inspect_addr addr = Sexp.Atom (Addr.string_of_value addr)
   let inspect_size = sexp_of_int
@@ -146,7 +155,7 @@ end = struct
         let base = Addr.npred base (slot*slot_size) in
         let+ data = foreach slot_size ~f:(fun byte ->
             Memory.load (Addr.nsucc base byte)) in
-        {Slot.info={target}; base; data})
+        {Slot.info={target}; base; data; offs=slot})
 
   let update_prog frame =
     let* start = Eval.pc in
@@ -292,33 +301,34 @@ let state = Primus.Machine.State.declare
     printed=0
   }
 
-module Inspect = struct
+
+module Inspector : sig
+  type t
   type action =
     | Word of Format.stag
     | Slot of Format.stag
     | Pass
 
-end
-
-module Inspector : sig
-  type t
-
-  val run : t -> Frame.t -> Frame.slot -> word -> Inspect.action
+  val run : t -> Frame.t -> Frame.slot -> word -> action
   val def :
     ?start:unit Analysis.t ->
     state:'a Primus.state ->
-    check:('a -> Frame.t -> Frame.slot -> word -> Inspect.action) ->
+    check:('a -> Frame.t -> Frame.slot -> word -> action) ->
     unit ->
     t
   val enable : t -> unit Analysis.t
   val update : t -> t Analysis.t
 end = struct
+  type action =
+    | Word of Format.stag
+    | Slot of Format.stag
+    | Pass
 
   type t = Inspector : {
       start : unit Analysis.t;
       renew : 'a Analysis.t;
       state : 'a option;
-      check : 'a -> Frame.t -> Frame.slot -> word -> Inspect.action
+      check : 'a -> Frame.t -> Frame.slot -> word -> action
     } -> t
 
   let def ?(start=Analysis.return ()) ~state ~check () =
@@ -735,7 +745,7 @@ let run start format prefix project =
   | Ok (_, project, _) -> project
   | Error _ -> project
 
-module Blocks = struct
+module Blocks : sig end = struct
   let blocks proj =
     Project.disasm proj |>
     Disasm.cfg |>
@@ -748,22 +758,38 @@ module Blocks = struct
       ~uuid:"b9f2901d-1f56-4bee-a979-fd01607c5751"
       ~name:"framespector-basic-blocks" blocks
 
-  let check blks frame slot word =
-    if Set.mem blks word then (Inspect.Word Blk) else Inspect.Pass
+  let check blks frame slot word : Inspector.action =
+    if Set.mem blks word then (Word Blk) else Pass
 
   let () = Inspectors.add @@ Inspector.def ~state ~check ()
 end
 
-module Backrefs = struct
+module Slotref : sig end = struct
   let state = Primus.Machine.State.declare
       ~uuid:"56446d70-b07a-43b1-b1e5-6f48e02a61bc"
       ~name:"framespector-slot-references" ignore
 
-  let check () frame slot word =
-    let is_referenced =
-      List.exists (Frame.slots frame) ~f:(fun s ->
-          Addr.equal (Frame.Slot.addr s) word) in
-    if is_referenced then (Inspect.Word Slotref) else Pass
+  let check () frame _ word : Inspector.action =
+    if Option.is_some (Frame.slot frame word)
+    then (Word Slotref)
+    else Pass
+
+  let () = Inspectors.add @@ Inspector.def ~state ~check ()
+end
+
+module Backref : sig end = struct
+  let state = Primus.Machine.State.declare
+      ~uuid:"56446d70-b07a-43b1-b1e5-6f48e02a61bc"
+      ~name:"framespector-back-references" ignore
+
+  let check () frame slot word : Inspector.action =
+    match Frame.slot frame word with
+    | None -> Pass
+    | Some rslot ->
+      let diff = Frame.Slot.offset slot - Frame.Slot.offset rslot in
+      if diff > 0
+      then Slot (Backref diff)
+      else Pass (* forward ref?  *)
 
   let () = Inspectors.add @@ Inspector.def ~state ~check ()
 end
