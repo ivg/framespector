@@ -224,7 +224,7 @@ type Format.stag +=
   | Byte
   | Changed
   | Slotref
-  | Backref of int
+  | Frameptr of {frame : Frame.t; src : int; dst : int}
   | Arg of string * int
   | Blk
 
@@ -526,7 +526,8 @@ module XML = struct
     | Data -> "<data>"
     | Changed -> "<changed>"
     | Slotref -> "<slotref>"
-    | Backref ref -> asprintf {|<backref slot="%d">|} ref
+    | Frameptr {src; dst} ->
+      asprintf {|<frameptr src="%d" dst="%d"> |} src dst
     | Arg (sub,pos) -> asprintf {|<arg sub=%S pos="%d">|} sub pos
     | Blk -> "<blk>"
     | _ -> ""
@@ -540,7 +541,7 @@ module XML = struct
     | Data -> "</data>"
     | Changed -> "</changed>"
     | Slotref -> "</slotref>"
-    | Backref _ -> "</backref>"
+    | Frameptr _ -> "</frameptr>"
     | Blk -> "</blk>"
     | Arg _ -> "</arg>"
     | _ -> ""
@@ -596,6 +597,14 @@ module SVG = struct
     let m = font_width in
     x*m + 2*m + 2*x*m + (x-1)*m + hor_margin
 
+  type point = {x : int; y : int}
+
+  let right_of_slot frame slot = {
+    x = frame_width frame - hor_margin / 2 + 5;
+    y = font_height * slot + ver_margin + font_height / 4;
+  }
+
+
   let open_tag = function
     | Stream | File _ -> preamble
     | Frame f ->
@@ -611,8 +620,15 @@ module SVG = struct
     | Addr -> asprintf {|<tspan x="%d" fill="white">|}
                 (hor_margin / 2)
     | Data -> "<tspan>"
-    | Slotref -> {|<tspan fill="red">|}
     | Blk -> {|<tspan fill="blue">|}
+    | Slotref -> {|<tspan fill="red">|}
+    | Frameptr {frame; src; dst} ->
+      let start = right_of_slot frame src in
+      asprintf {|<path fill="none" stroke="red" d="
+      M %d,%d
+      l 10,-10
+      v %d
+      l -10,-10"/>|} start.x start.y ((dst - src + 1) * font_height)
     | _ -> ""
 
   let close_tag = function
@@ -786,10 +802,9 @@ module Backref : sig end = struct
     match Frame.slot frame word with
     | None -> Pass
     | Some rslot ->
-      let diff = Frame.Slot.offset slot - Frame.Slot.offset rslot in
-      if diff > 0
-      then Slot (Backref diff)
-      else Pass (* forward ref?  *)
+      let src = Frame.Slot.offset slot
+      and dst = Frame.Slot.offset rslot in
+      Slot (Frameptr {frame; src; dst})
 
   let () = Inspectors.add @@ Inspector.def ~state ~check ()
 end
