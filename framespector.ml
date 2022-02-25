@@ -605,16 +605,19 @@ module SVG = struct
     y = font_height * (slot + 1) + ver_margin + font_height / 4;
   }
 
-
   let escape =
     String.concat_map ~f:(function
         | '<' -> "&lt;"
         | '>' -> "&gt;"
         | c -> String.of_char c)
 
-
   let open_tag = function
-    | Stream | File _ -> preamble
+    | Stream -> preamble
+    | File {prev; next} -> asprintf {|%s
+<svg xmlns="http://www.w3.org/2000/svg"
+     font-family="monospace"
+     font-size="%dpx">
+<a href=%S>|} preamble font_height next
     | Frame f ->
       let prog = Frame.prog f in
       let pc = Frame.Prog.start prog in
@@ -622,15 +625,9 @@ module SVG = struct
           (Addr.string_of_value pc)
           pp_trace (Frame.Prog.trace prog) in
       asprintf {|
-<svg xmlns="http://www.w3.org/2000/svg"
-     height="%dpx"
-     width="%dpx"
-     font-family="monospace"
-     font-size="%dpx">
-    <rect fill="black" height="100%%" width="100%%"/>
+    <rect fill="black" height="%d" width="%d"/>
     <text x="%d" fill="green" y="1em">%s</text>
-|}
-        (frame_height f) (frame_width f) font_height
+|} (frame_height f) (frame_width f)
         (hor_margin / 2)
         (escape title)
     | Slot (s,i) -> asprintf {|<text fill="grey" y="%dem">|} (i+2)
@@ -650,9 +647,10 @@ module SVG = struct
     | _ -> ""
 
   let close_tag = function
-    | Frame _ -> "</svg>"
+    | Frame _ -> ""
     | Slot _ -> "</text>"
     | Addr | Data | Blk | Slotref | Arg _ -> "</tspan>"
+    | File _ -> "</a></svg>"
     | _ -> ""
 
   let enter_tag = XML.enter_tag
@@ -731,6 +729,7 @@ let with_formatter ~prefix ~format printed k = match prefix with
     let next = make_name prefix format (printed+1) in
     Out_channel.with_file curr ~f:(fun out ->
         let ppf = Format.formatter_of_out_channel out in
+        Formats.enable format ppf;
         Format.pp_open_stag ppf (File {prev;curr;next});
         k ppf;
         Format.pp_close_stag ppf ();
@@ -752,7 +751,6 @@ let print_pending format prefix _ =
     printed = frames.printed + 1
   } >>| fun () ->
   with_formatter ~prefix ~format frames.printed @@ fun ppf ->
-  Formats.enable format ppf;
   if frames.printed = 0 && Option.is_none prefix
   then Format.(pp_open_stag std_formatter) Stream;
   markup_frame ppf pending previous
