@@ -225,7 +225,7 @@ type Format.stag +=
   | Changed
   | Slotref
   | Frameptr of {frame : Frame.t; src : int; dst : int}
-  | Arg of string * int
+  | Arg of {sub : string; pos : int}
   | Blk
 
 let when_frame_pointer fps v k =
@@ -529,7 +529,7 @@ module XML = struct
     | Slotref -> "<slotref>"
     | Frameptr {src; dst} ->
       asprintf {|<frameptr src="%d" dst="%d"> |} src dst
-    | Arg (sub,pos) -> asprintf {|<arg sub=%S pos="%d">|} sub pos
+    | Arg {sub;pos} -> asprintf {|<arg sub=%S pos="%d">|} sub pos
     | Blk -> "<blk>"
     | _ -> ""
 
@@ -646,12 +646,13 @@ module SVG = struct
       l 10,-10
       v %d
       l -10,-10"/>|} start.x start.y ((dst - src + 1) * font_height)
+    | Arg _ -> {|<tspan fill="magenta">|}
     | _ -> ""
 
   let close_tag = function
     | Frame _ -> "</svg>"
     | Slot _ -> "</text>"
-    | Addr | Data | Blk | Slotref -> "</tspan>"
+    | Addr | Data | Blk | Slotref | Arg _ -> "</tspan>"
     | _ -> ""
 
   let enter_tag = XML.enter_tag
@@ -810,6 +811,7 @@ module Slotref : sig end = struct
   let () = Inspectors.add @@ Inspector.def ~state ~check ()
 end
 
+
 module Backref : sig end = struct
   let state = Primus.Machine.State.declare
       ~uuid:"56446d70-b07a-43b1-b1e5-6f48e02a61bc"
@@ -824,6 +826,47 @@ module Backref : sig end = struct
       Slot (Frameptr {frame; src; dst})
 
   let () = Inspectors.add @@ Inspector.def ~state ~check ()
+end
+
+module Args : sig end = struct
+  let state = Primus.Machine.State.declare
+      ~uuid:"42fce549-9965-4848-9c6a-6f1996c7e7dd"
+      ~name:"framespector-args" @@ fun _ ->
+    Word.Map.empty
+
+  let drop_last xs =
+    Option.value (List.drop_last xs) ~default:[]
+
+  let enter_call (name,args) =
+    Analysis.Local.update state ~f:(fun vals ->
+        List.foldi args ~init:vals ~f:(fun num vals arg ->
+            let key = Primus.Value.to_word arg
+            and data = name,num in
+            Map.add_multi vals ~key ~data))
+
+  let leave_call (name,args) =
+    Analysis.Local.update state ~f:(fun vals ->
+        List.foldi (drop_last args) ~init:vals ~f:(fun i vals arg ->
+            Map.change vals (Primus.Value.to_word arg) ~f:(function
+                | None -> None
+                | Some bindings ->
+                  List.filter bindings ~f:(fun (sub,pos) ->
+                      not (String.equal sub name && pos = i)) |> function
+                  | [] -> None
+                  | left -> Some left)))
+
+  let start = Analysis.sequence [
+      Primus.Linker.Trace.call >>> enter_call;
+      Primus.Linker.Trace.return >>> leave_call;
+    ]
+
+
+  let check vals frame slot word : Inspector.action =
+    match Map.find vals word with
+    | Some ((sub,pos) :: _)  -> Word (Arg {sub; pos})
+    | _ -> Pass
+
+  let () = Inspectors.add @@ Inspector.def ~start ~state ~check ()
 end
 
 let start = Extension.Configuration.parameter
