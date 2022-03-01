@@ -12,11 +12,12 @@ module Memory = Primus.Memory.Make(Analysis)
 
 open Analysis.Syntax
 open Analysis.Let
+open Extension.Syntax
 
-let max_frame_size = 4096
+let max_frame_size = 32768
 
 module Frame : sig
-  type t
+  type t [@@deriving compare]
   type slot
   type prog
 
@@ -50,7 +51,7 @@ end = struct
 
   type info = {
     target : Theory.Target.t;
-  }
+  } [@@deriving compare]
 
   let is_big {target} =
     Theory.Endianness.(equal eb) @@
@@ -62,7 +63,7 @@ end = struct
       base : addr;
       data : word list;
       offs : int;
-    }
+    } [@@deriving compare]
 
     let addr s = s.base
     let data s = s.data
@@ -100,7 +101,7 @@ end = struct
     let trace p = List.rev p.trace
   end
 
-  type slot = Slot.t
+  type slot = Slot.t [@@deriving compare]
   type prog = Prog.t
 
   type t = {
@@ -108,8 +109,8 @@ end = struct
     size : int;
     info : info;
     data : slot list;
-    prog : prog;
-  }
+    prog : prog [@compare.ignore];
+  } [@@deriving compare]
 
 
   let target f = f.info.target
@@ -133,7 +134,6 @@ end = struct
   let state = Primus.Machine.State.declare
       ~uuid:"db67e5a2-2e36-479a-a656-74154ae46ed0"
       ~name:"framespector" @@ fun proj ->
-
     let target = Project.target proj in {
       base = Addr.data_addr target Bitvec.zero;
       size = Theory.Target.data_addr_size target / 8;
@@ -166,19 +166,19 @@ end = struct
       else [pos] in
     {Prog.start;trace}
 
-  let was_changed frame =
-    let* data = read_slots frame in
-    let* prog = update_prog frame in
-    let frame = {frame with data; prog} in
-    Analysis.Local.put state frame >>= fun () ->
-    Analysis.Observation.make was_changed frame
+  let was_changed after =
+    let* data = read_slots after in
+    let* prog = update_prog after in
+    let after = {after with data; prog} in
+    Analysis.Local.put state after >>= fun () ->
+    Analysis.Observation.make was_changed after
 
   let update f =
     let* () = Analysis.Local.update state ~f in
-    let* frame = Analysis.Local.get state in
-    if Word.is_zero frame.base
+    let* after = Analysis.Local.get state in
+    if Word.is_zero after.base
     then Analysis.return ()
-    else was_changed frame
+    else was_changed after
 
   let extent s base addr =
     if Addr.(addr < base)
@@ -417,14 +417,23 @@ end = struct
     leave_slot = actions.leave_slot + 1;
   }
 
-  let sizes i =
-    List.filter_map [1; 2; 4; 8] ~f:(fun m ->
+  let frame_words bytes =
+    if bytes = 8
+    then [1; 2; 4; 8]
+    else [1; 2; 4]
+
+
+  let sizes bytes i =
+    frame_words bytes |>
+    List.filter_map ~f:(fun m ->
         if i mod m = 0 then Some (Size.of_int_exn (m*8))
         else None)
 
   let apply frame slot =
-    List.(fold (range 0 8)) ~init ~f:(fun actions i ->
-        List.fold (sizes i) ~init:actions ~f:(fun actions size ->
+    let t = Frame.target frame in
+    let bytes = Theory.Target.data_addr_size t / 8 in
+    List.(fold (range 0 bytes)) ~init ~f:(fun actions i ->
+        List.fold (sizes bytes i) ~init:actions ~f:(fun actions size ->
             List.fold !selected ~init:actions ~f:(fun actions inspector ->
                 let bytes = Size.in_bytes size in
                 match Frame.Slot.read ~size slot (i/bytes) with
@@ -512,15 +521,32 @@ module XML = struct
   open Format
 
   let straddr x = Addr.string_of_value x
+  let escape =
+    String.concat_map ~f:(function
+        | '<' -> "&lt;"
+        | '>' -> "&gt;"
+        | c -> String.of_char c)
+
+  let title frame =
+    let prog = Frame.prog frame in
+    let pc = Frame.Prog.start prog in
+    escape @@
+    asprintf "%s %a"
+      (Addr.string_of_value pc)
+      pp_trace (Frame.Prog.trace prog)
+
+
 
   let open_tag = function
     | Stream -> "<frames>"
     | File {prev; curr; next} ->
       asprintf "<file prev=%S curr=%S next=%S>" prev curr next
     | Frame frame ->
-      asprintf {|<frame base=%S size="%d">|}
+      asprintf {|<frame base=%S size="%d">
+  <title>%s</title>|}
         (straddr (Frame.base frame))
         (Frame.size frame)
+        (title frame)
     | Slot (slot, pos) ->
       asprintf {|<slot number="%d">|} pos
     | Addr -> "<addr>"
@@ -585,8 +611,8 @@ module SVG = struct
 |}
 
   let font_height = 20  (* px *)
-  let hor_margin = 40 (* px *)
-  let ver_margin = 10 (* px *)
+  let hor_margin = 40   (* px *)
+  let ver_margin = 10   (* px *)
   let font_width = Float.(to_int (float font_height * 0.6))
 
   let frame_height frame =
@@ -596,7 +622,7 @@ module SVG = struct
     let t = Frame.target frame in
     let x = Theory.Target.data_addr_size t / 8 in
     let m = font_width in
-    x*m + 2*m + 2*x*m + (x-1)*m + hor_margin
+    8*m + 2*m + 2*x*m + (x-1)*m + hor_margin
 
   type point = {x : int; y : int}
 
@@ -604,12 +630,6 @@ module SVG = struct
     x = frame_width frame - hor_margin / 2 + 5;
     y = font_height * (slot + 1) + ver_margin + font_height / 4;
   }
-
-  let escape =
-    String.concat_map ~f:(function
-        | '<' -> "&lt;"
-        | '>' -> "&gt;"
-        | c -> String.of_char c)
 
   let open_tag = function
     | Stream -> preamble
@@ -624,12 +644,16 @@ module SVG = struct
       let title = asprintf "%s %a"
           (Addr.string_of_value pc)
           pp_trace (Frame.Prog.trace prog) in
+      let title_width =
+        String.length title * font_width + hor_margin in
       asprintf {|
     <rect fill="black" height="%d" width="%d"/>
     <text x="%d" fill="green" y="1em">%s</text>
-|} (frame_height f) (frame_width f)
+|}
+        (frame_height f)
+        (max (frame_width f) title_width)
         (hor_margin / 2)
-        (escape title)
+        (XML.escape title)
     | Slot (s,i) -> asprintf {|<text fill="grey" y="%dem">|} (i+2)
     | Addr -> asprintf {|<tspan x="%d" fill="white">|}
                 (hor_margin / 2)
@@ -719,14 +743,27 @@ let peek_frames {pending; compare} k =
   | Some frame,None -> k frame None
   | Some last,Some before -> k last (Some before)
 
-let make_name prefix suffix printed =
+let make_name ?(relative=false) prefix suffix printed =
+  let prefix = if relative
+    then Filename.basename prefix
+    else prefix in
   Format.asprintf "%s-%04d.%s" prefix printed suffix
+
+let has_dir path =
+  Sys.file_exists path && Sys.is_directory path
+
+let check_directory path =
+  let parent = Filename.dirname path in
+  if Fn.non has_dir parent
+  then invalid_argf "The directory `%s' doesn't exist, please create it."
+      parent ()
 
 let with_formatter ~prefix ~format printed k = match prefix with
   | Some prefix ->
-    let prev = make_name prefix format (printed-1) in
+    let prev = make_name ~relative:true prefix format (printed-1) in
     let curr = make_name prefix format printed in
-    let next = make_name prefix format (printed+1) in
+    let next = make_name ~relative:true prefix format (printed+1) in
+    check_directory curr;
     Out_channel.with_file curr ~f:(fun out ->
         let ppf = Format.formatter_of_out_channel out in
         Formats.enable format ppf;
@@ -734,7 +771,9 @@ let with_formatter ~prefix ~format printed k = match prefix with
         k ppf;
         Format.pp_close_stag ppf ();
         Format.pp_print_flush ppf ())
-  | None -> k Format.std_formatter
+  | None ->
+    Formats.enable format Format.std_formatter;
+    k Format.std_formatter
 
 let close_stream prefix _ =
   if Option.is_none prefix
@@ -750,10 +789,13 @@ let print_pending format prefix _ =
     pending = None;
     printed = frames.printed + 1
   } >>| fun () ->
-  with_formatter ~prefix ~format frames.printed @@ fun ppf ->
-  if frames.printed = 0 && Option.is_none prefix
-  then Format.(pp_open_stag std_formatter) Stream;
-  markup_frame ppf pending previous
+  match previous with
+  | Some previous when Frame.compare previous pending = 0 -> ()
+  | _ ->
+    with_formatter ~prefix ~format frames.printed @@ fun ppf ->
+    if frames.printed = 0 && Option.is_none prefix
+    then Format.(pp_open_stag std_formatter) Stream;
+    markup_frame ppf pending previous
 
 let init format prefix =
   let* pointers = frame_pointers in
@@ -765,17 +807,6 @@ let init format prefix =
       Primus.System.init >>> Inspectors.start;
       Primus.System.stop >>> close_stream prefix;
     ]
-
-let run start format prefix project =
-  let system = Primus.System.Repository.get "stubbed-executor"
-      ~package:"bap" in
-  let state = Toplevel.current () in
-  let init = init format prefix in
-  let start = Linker.exec (`symbol start) in
-  match Primus.System.run ~init ~start system project state
-          ~args:[|"test"; "42"|] with
-  | Ok (_, project, _) -> project
-  | Error _ -> project
 
 module Blocks : sig end = struct
   let blocks proj =
@@ -858,7 +889,6 @@ module Args : sig end = struct
       Primus.Linker.Trace.return >>> leave_call;
     ]
 
-
   let check vals frame slot word : Inspector.action =
     match Map.find vals word with
     | Some ((sub,pos) :: _)  -> Word (Arg {sub; pos})
@@ -867,23 +897,54 @@ module Args : sig end = struct
   let () = Inspectors.add @@ Inspector.def ~start ~state ~check ()
 end
 
-let start = Extension.Configuration.parameter
-    Extension.Type.(string =? "_start") "start"
+include struct
+  open Extension
+  let start =
+    Configuration.parameter Type.(string =? "_start") "start"
+      ~doc:"The name of the function to execute."
 
-let prefix = Extension.Configuration.parameter
-    Extension.Type.(some string) "paginate-prefix"
-    ~doc:"If specified then the output each frame to a \
-          separate file named $(b,PREFIX-xxxx.frame), where \
-          $(b,xxxx) stands for the frame number"
+  let prefix =
+    Configuration.parameter Type.(some string) "paginate-prefix"
+      ~doc:"If specified then the output each frame to a \
+            separate file named $(b,PREFIX-xxxx.frame), where \
+            $(b,xxxx) stands for the frame number"
 
-let format = Extension.Configuration.parameter
-    Extension.Type.(string =? "org") "format"
-    ~doc:"Print frames in the selected format"
+  let format =
+    Configuration.parameter Type.(string =? "org") "format"
+      ~doc:"Print frames in the selected format"
+
+  let args =
+    Configuration.parameter Type.(list string) "args"
+      ~doc:"The list of command-line arguments passed to the program \
+            (excluding the binary name)."
+
+  let system =
+    Configuration.parameter Type.(string =? "bap:microexecutor-base") "system"
+      ~doc:"The name of the Primus system that is used to execute the program."
+end
+
+let read_system name =
+  let sys = KB.Name.read ~package:"bap" name in
+  match Primus.System.Repository.find sys with
+  | Some sys -> sys
+  | None ->
+    invalid_argf
+      "Can't find the system %s, see `bap primus-systems' \
+       for the full list of systems" (KB.Name.show sys) ()
+
+let run ctxt project =
+  let (~@) v = Extension.Configuration.get ctxt v in
+  let system = read_system ~@system in
+  let state = Toplevel.current () in
+  let init = init ~@format ~@prefix in
+  let start = Linker.exec (`symbol ~@start) in
+  let filename = Option.value (Project.get project filename)
+      ~default:"./test" in
+  let args = Array.of_list (filename :: ~@args) in
+  match Primus.System.run ~init ~start system project state ~args with
+  | Ok (_, project, _) -> project
+  | Error _ -> project
 
 let () = Extension.declare @@ fun ctxt ->
-  let open Extension.Syntax in
-  let start = ctxt-->start in
-  let prefix = ctxt-->prefix in
-  let format = ctxt-->format in
-  Project.register_pass (run start format prefix);
+  Project.register_pass (run ctxt);
   Ok ()
