@@ -22,9 +22,10 @@ This command will emulate the `examples/e2` (do `make examples/e2` to build it) 
 
 # Building with OPAM
 
-If you have BAP installed, then just do
+If you have opam installed, then install bap (if you haven't yet) and build and install the plugin
 ```
-bapbuild framespector.plugin
+opan install bap
+bapbuild -pkg bap-primus framespector.plugin
 bapbundle install framespector.plugin
 ```
 
