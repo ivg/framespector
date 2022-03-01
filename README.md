@@ -1,6 +1,7 @@
 # Stack Frame Inspector
 
-A simple BAP plugin, useful for education purposes mostly, that inspects and prints the stack frame during program execution. The plugin uses Primus interepreter to emulate the program and supports various modes of execution, including symbolic execution. The stack frames could be printed in XML, SVG, and orgmode formats. The SVG output was tested in a chromium-based browser and there's no guarantee that it will work for all browsers and rendering engines.
+A simple BAP plugin, useful for education purposes mostly, that inspects and prints the stack frame during program execution. The plugin uses Primus interepreter to emulate the program and supports various modes of execution, including symbolic execution. The stack frames could be printed in XML, SVG, and orgmode formats. The SVG output was tested in a chromium-based browser and there's no guarantee that it will work for all browsers and rendering engines. Below is the sample frame generated from the SVG output,
+![example frame](./assets/e2-0030.png)
 
 Several simple inspectors (analyses that inspect the contents of the frame) are implemented:
 
